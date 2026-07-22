@@ -45,13 +45,13 @@ server.on("connection", socket => {
     }));
 
 
-    // Send existing players to the new player
-    socket.send(JSON.stringify({
-        type: "players",
-        players: Array.from(players.values())
-            .map(p => p.player)
-    }));
-
+    // Send existing players to the new player (excluding themselves)
+socket.send(JSON.stringify({
+    type: "players",
+    players: Array.from(players.values())
+        .filter(p => p.player.id !== id)  // ✅ Exclude yourself
+        .map(p => p.player)
+}));
 
     // Tell everyone else a new player joined
     broadcast({
