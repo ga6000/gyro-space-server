@@ -90,7 +90,8 @@ socket.send(JSON.stringify({
                         id:id,
                         x:data.x,
                         y:data.y,
-                        angle:data.angle
+                        angle:data.angle,
+                        shot:data.shot  // ✅ ADD THIS LINE to broadcast shots
                     }
                 }, socket);
 
