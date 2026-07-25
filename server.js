@@ -77,9 +77,21 @@ socket.send(JSON.stringify({
 
                 if(current){
 
+                    // Only broadcast if position/angle changed or shot fired
+                    const positionChanged = current.player.x !== data.x || 
+                                           current.player.y !== data.y || 
+                                           current.player.angle !== data.angle;
+                    const shotFired = data.shot;
+                    const aliveStateChanged = current.player.isAlive !== data.isAlive;
+
+                    if (!positionChanged && !shotFired && !aliveStateChanged) {
+                        return; // Skip broadcast if nothing changed
+                    }
+
                     current.player.x = data.x;
                     current.player.y = data.y;
                     current.player.angle = data.angle;
+                    current.player.isAlive = data.isAlive;
 
                 }
 
@@ -92,7 +104,7 @@ socket.send(JSON.stringify({
                         y:data.y,
                         angle:data.angle,
                         shot:data.shot,
-                        isAlive:data.isAlive  // ✅ ADD THIS LINE to broadcast alive state
+                        isAlive:data.isAlive
                     }
                 }, socket);
 
