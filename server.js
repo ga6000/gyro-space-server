@@ -91,7 +91,8 @@ socket.send(JSON.stringify({
                         x:data.x,
                         y:data.y,
                         angle:data.angle,
-                        shot:data.shot  // ✅ ADD THIS LINE to broadcast shots
+                        shot:data.shot,
+                        isAlive:data.isAlive  // ✅ ADD THIS LINE to broadcast alive state
                     }
                 }, socket);
 
