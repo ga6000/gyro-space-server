@@ -172,6 +172,43 @@ server.on("connection", socket => {
             }
 
 
+            if (data.type === "kill-credit") {
+
+                // Sent by the VICTIM's client the moment it detects it was
+                // hit by another player's bullet (that detection only ever
+                // happens locally, on the victim's own collision check --
+                // the shooter's client has no way to know its bullet
+                // connected). This message tells the server "player X
+                // killed me," and the server relays it to player X only,
+                // so X's client can credit its own multiplier/score.
+                //
+                // This is inherently victim-reported and therefore
+                // trivially spoofable by a modified client claiming kills
+                // that never happened. For a 3-10 person friend group
+                // that's an acceptable tradeoff -- closing it properly
+                // would mean the server itself simulating bullet
+                // collisions, which is a much bigger architectural change
+                // (server-authoritative physics) than this project needs
+                // right now.
+                const room = rooms.get(roomCode);
+                const shooterEntry = room && room.get(data.shooterId);
+
+                if (shooterEntry && shooterEntry.socket.readyState === WebSocket.OPEN) {
+                    shooterEntry.socket.send(JSON.stringify({
+                        type: "kill-credit",
+                        victimId: id,
+                        victimName: player.name,
+                        killType: "player"
+                    }));
+                }
+                // If the shooter has already disconnected or isn't in this
+                // room (e.g. they left right as the shot landed), this
+                // silently does nothing -- there's no one left to credit.
+
+                return;
+            }
+
+
         } catch (error) {
 
             console.error(
