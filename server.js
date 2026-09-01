@@ -25,6 +25,16 @@ console.log(`WebSocket server running on port ${PORT}`);
 const LEGACY_GAME = "_legacy";
 const DEFAULT_ROOM = "public";
 
+// The hub gets its own namespace instead of riding the legacy one.
+// It used to send no "game" field, which put it in "_legacy" -- the
+// same namespace space-tracer.html still uses. That was harmless while
+// the hub only showed a roster, but the lobby's ready-check requires
+// EVERY player in the room to click Continue, and a friend already
+// flying around in Space Tracer can't click anything on the hub. They
+// would have deadlocked every launch. Separate namespace, so the
+// ready-check population is exactly "people looking at the hub."
+const HUB_GAME = "_hub";
+
 // rooms: Map<roomKey, {
 //   game, code, seed, hostId,
 //   players: Map<playerId, {socket, player}>,
@@ -87,7 +97,20 @@ function getOrCreateRoom(game, code) {
             seed: (Math.random() * 0x7fffffff) | 0,
             hostId: null,
             players: new Map(),
-            votes: new Map()
+            votes: new Map(),
+
+            // Hub lobby state. Only the hub ("_hub" namespace) ever
+            // touches this; games have their own start flow and never
+            // send ready-update. Kept on the room rather than in a
+            // separate map so it dies with the room automatically.
+            //   leader    -- gameId with strictly the most votes, or null
+            //   ready     -- voterNames who have clicked Continue FOR that leader
+            //   timer     -- in-flight launch countdown, null when not launching
+            lobby: {
+                leader: null,
+                ready: new Set(),
+                timer: null
+            }
         });
         console.log(`Room created: ${key}`);
     }
@@ -98,6 +121,11 @@ function getOrCreateRoom(game, code) {
 function deleteRoomIfEmpty(key) {
     const room = rooms.get(key);
     if (room && room.players.size === 0) {
+        // Kill any pending launch countdown with the room. Otherwise a
+        // room recreated under the same key within the countdown window
+        // would have the previous room's timer wipe its ready state.
+        if (room.lobby && room.lobby.timer) clearTimeout(room.lobby.timer);
+
         rooms.delete(key);
         console.log(`Room closed (empty): ${key}`);
     }
@@ -118,6 +146,207 @@ function assignHostIfNeeded(room, key) {
         console.log(`Host for ${key} is now ${room.hostId}`);
     }
     return true;
+}
+
+
+// ===================================================
+//   HUB LOBBY: LEADER, READY-CHECK, LAUNCH COUNTDOWN
+// ===================================================
+// Only the hub (the "_hub" namespace) uses any of this -- games have
+// their own start flow and never send "ready-update". It lives here
+// rather than in the hub client for one reason: a player who opens the
+// hub after everyone else has already voted and readied needs to be
+// told the current state, and only the server can tell them. The same
+// argument that made the vote snapshot server-side applies unchanged.
+//
+// The countdown is broadcast as a DURATION, not a wall-clock deadline.
+// Friends' machines don't agree on the current time, so an absolute
+// timestamp would drift by whatever their clocks differ by; a duration
+// only drifts by one network hop.
+const LAUNCH_DELAY_MS = 3000;
+
+// Votes are already keyed by name (see the vote-update handler), so
+// ready is too -- otherwise a player who reconnects mid-lobby would be
+// counted as a second, permanently-un-ready person and deadlock the
+// launch. Two players choosing the same name collide; that's
+// pre-existing in votes and fine for a 3-10 person friend group.
+function playerKey(p) {
+    return p.name || p.id;
+}
+
+function roomPlayerKeys(room) {
+    const keys = new Set();
+    for (const entry of room.players.values()) {
+        keys.add(playerKey(entry.player));
+    }
+    return keys;
+}
+
+// Strict plurality: the one gameId with MORE votes than any other.
+// A tie returns null, which is what makes the hub's Continue button
+// disappear rather than picking an arbitrary winner for the group.
+// Computed here and only here so no two clients can disagree about
+// whether a given vote spread is a tie.
+function computeLeader(room) {
+    const tally = new Map();
+
+    for (const gameId of room.votes.values()) {
+        tally.set(gameId, (tally.get(gameId) || 0) + 1);
+    }
+
+    let leader = null;
+    let best = 0;
+    let tied = false;
+
+    for (const [gameId, count] of tally) {
+        if (count > best) {
+            leader = gameId;
+            best = count;
+            tied = false;
+        } else if (count === best) {
+            tied = true;
+        }
+    }
+
+    return tied ? null : leader;
+}
+
+function lobbyMessage(room) {
+    return {
+        type: "lobby",
+        leaderGameId: room.lobby.leader,
+        ready: Array.from(room.lobby.ready),
+        launching: room.lobby.timer !== null
+    };
+}
+
+function cancelLaunch(roomKey, reason) {
+    const room = rooms.get(roomKey);
+    if (!room || !room.lobby.timer) return; // Not counting down -- nothing to cancel, and broadcasting a cancel nobody asked for would flicker the button
+
+    clearTimeout(room.lobby.timer);
+    room.lobby.timer = null;
+
+    console.log(`Launch cancelled in ${roomKey}: ${reason}`);
+
+    broadcastToRoom(roomKey, {
+        type: "launch-cancel",
+        reason: reason
+    });
+}
+
+// Starts the countdown once EVERY player currently in the room is
+// ready. Deliberately strict: nobody gets left behind on the hub while
+// their friends load into a game.
+function evaluateLaunch(roomKey) {
+    const room = rooms.get(roomKey);
+    if (!room) return;
+
+    if (!room.lobby.leader) return;
+    if (room.lobby.timer) return;      // Already counting down
+    if (room.players.size === 0) return;
+
+    for (const name of roomPlayerKeys(room)) {
+        if (!room.lobby.ready.has(name)) return;
+    }
+
+    room.lobby.timer = setTimeout(() => {
+        const current = rooms.get(roomKey);
+        if (!current) return;
+
+        current.lobby.timer = null;
+
+        // Everyone has navigated into the game by now. Clearing means a
+        // player who bounces straight back to the hub doesn't walk into
+        // a stale all-ready state that immediately fires again.
+        current.lobby.ready.clear();
+    }, LAUNCH_DELAY_MS);
+
+    console.log(`Launching ${room.lobby.leader} in ${roomKey} (${room.players.size} players)`);
+
+    broadcastToRoom(roomKey, {
+        type: "launch",
+        gameId: room.lobby.leader,
+        delayMs: LAUNCH_DELAY_MS
+    });
+}
+
+// ===================================================
+//   CROSS-GAME PRESENCE
+// ===================================================
+// Rooms are namespaced by game, so the hub's room ("_hub:ASDF") can't
+// see the people in "zombie:ASDF" -- which is correct for the
+// ready-check (someone mid-game can't click Continue, and counting them
+// would deadlock every launch) but wrong for the roster, where "who's
+// around" should include the friend who wandered into Zombie.
+//
+// So: presence is computed ACROSS namespaces for one room code and sent
+// to the hub only. It is deliberately separate from the "players"
+// roster the hub already tracks -- these people are visible, not
+// countable.
+function presenceFor(code) {
+    const list = [];
+
+    for (const room of rooms.values()) {
+        if (room.code !== code) continue;
+        if (room.game === HUB_GAME) continue;   // Already in the hub's own roster
+
+        for (const entry of room.players.values()) {
+            list.push({
+                name: entry.player.name || entry.player.id,
+                color: entry.player.color,
+                game: room.game
+            });
+        }
+    }
+
+    return list;
+}
+
+function broadcastPresence(code) {
+    const hubKey = roomKeyFor(HUB_GAME, code);
+    if (!rooms.has(hubKey)) return;   // Nobody on the hub for this code -- nothing to tell
+
+    broadcastToRoom(hubKey, {
+        type: "presence",
+        players: presenceFor(code)
+    });
+}
+
+
+// Single funnel for everything that can change the lobby: a vote, a
+// ready click, a join, a leave. Recomputes the leader, discards ready
+// state that no longer applies, broadcasts, then re-checks the launch
+// condition. Every caller goes through here so there is exactly one
+// place that decides what the lobby looks like.
+function refreshLobby(roomKey) {
+    const room = rooms.get(roomKey);
+    if (!room) return;
+
+    // Game rooms never see any of this. Keeps their traffic byte-for-
+    // byte what it is today, so none of the working multiplayer games
+    // are touched by a hub-only feature.
+    if (room.game !== HUB_GAME) return;
+
+    const nextLeader = computeLeader(room);
+
+    if (nextLeader !== room.lobby.leader) {
+        // A ready click means "I'm ready to play THIS game" -- if the
+        // group's choice moved, that consent doesn't carry over.
+        room.lobby.leader = nextLeader;
+        room.lobby.ready.clear();
+        cancelLaunch(roomKey, "selection changed");
+    }
+
+    // Drop ready entries from players who have left, so their dot
+    // doesn't sit on the Continue button after they're gone.
+    const present = roomPlayerKeys(room);
+    for (const name of room.lobby.ready) {
+        if (!present.has(name)) room.lobby.ready.delete(name);
+    }
+
+    broadcastToRoom(roomKey, lobbyMessage(room));
+    evaluateLaunch(roomKey);
 }
 
 
@@ -229,6 +458,23 @@ server.on("connection", socket => {
                     hostId: room.hostId
                 });
 
+                // Somebody arriving mid-countdown cancels it -- they
+                // haven't agreed to anything yet, and launching out from
+                // under a friend who just walked in is exactly the
+                // behaviour the strict rule exists to prevent. The
+                // refresh that follows also gives the new player their
+                // lobby snapshot, which is the reason this state lives
+                // on the server at all.
+                cancelLaunch(roomKey, "a player joined");
+                refreshLobby(roomKey);
+
+                // Every join anywhere changes the cross-game picture for
+                // whoever is on the hub -- and since the joiner is
+                // already in the room by this point, this doubles as the
+                // arrival snapshot for a hub client. No separate direct
+                // send: that would deliver the same thing twice.
+                broadcastPresence(code);
+
                 return;
             }
 
@@ -298,6 +544,36 @@ server.on("connection", socket => {
                     gameId: room.votes.get(voterName) || null
                 });
 
+                // A vote can move which game is winning, which retires
+                // everyone's ready state and kills any countdown.
+                refreshLobby(roomKey);
+
+                return;
+            }
+
+
+            // Ready-check on the hub's Continue button. The gameId must
+            // match what the server currently considers the winner --
+            // otherwise a click that was in flight while the leader
+            // changed would register as consent for a game the player
+            // never actually saw on the button. Same stale-message
+            // guard as the un-vote path above.
+            if (data.type === "ready-update") {
+
+                if (room.game !== HUB_GAME) return;
+
+                const readyName = playerKey(player);
+
+                if (data.ready) {
+                    if (!room.lobby.leader || data.gameId !== room.lobby.leader) return;
+                    room.lobby.ready.add(readyName);
+                } else {
+                    room.lobby.ready.delete(readyName);
+                    cancelLaunch(roomKey, "a player is no longer ready");
+                }
+
+                refreshLobby(roomKey);
+
                 return;
             }
 
@@ -309,7 +585,16 @@ server.on("connection", socket => {
                     name: player.name,
                     color: player.color,
                     x: data.x,
-                    y: data.y
+                    y: data.y,
+                    // What the sender is pointing AT, plus where inside
+                    // it. Raw viewport percentages alone stopped being
+                    // meaningful once the hub paginated its games --
+                    // page 2 on their screen is page 1 on yours. The
+                    // receiver resolves the anchor against its own
+                    // layout and falls back to x/y when it can't.
+                    anchor: data.anchor || null,
+                    ax: data.ax,
+                    ay: data.ay
                 }, socket);
 
                 return;
@@ -467,7 +752,20 @@ server.on("connection", socket => {
                     });
                 }
 
+                // A leave RE-EVALUATES rather than cancelling: if the
+                // one person who hadn't clicked Continue closes their
+                // tab, everyone still here should launch, not stall
+                // waiting on someone who's gone.
+                if (room.lobby) {
+                    room.lobby.ready.delete(playerKey(player));
+                    refreshLobby(roomKey);
+                }
+
                 deleteRoomIfEmpty(roomKey);
+
+                // After the cleanup, so a room that just emptied isn't
+                // still counted in the snapshot.
+                broadcastPresence(room.code);
             }
 
         } else {
