@@ -60,11 +60,28 @@ function roomKeyFor(game, code) {
 // scheme those clients already use, so this produces the SAME color
 // they were computing themselves. Existing deployed clients therefore
 // see no change in behavior -- they just stop being the source of truth.
+/*
+ * MUST stay byte-identical to `shared/identity.js` in the My-Games repo.
+ * That file is the client's copy, which exists because `file://` play has no
+ * server to ask. `node scripts/check-identity-parity.js` (run from the
+ * My-Games repo root) compares the two and fails on drift — run it after
+ * touching this array or the hash below.
+ *
+ * Widened 2026-09-03 from 10 colours to 16. The old palette had hues 45 and 50
+ * five degrees apart — two indistinguishable yellows, minimum pairwise ΔE 9.7,
+ * so two players with DIFFERENT colours could look identical. These 16 are
+ * solved for maximum minimum ΔE (25.9) subject to ≥1.9:1 contrast against both
+ * a near-black canvas and glucose-dash's white mall.
+ */
 const COLOR_PALETTE = [
-    "hsl(0, 85%, 60%)", "hsl(30, 90%, 55%)", "hsl(50, 95%, 55%)",
-    "hsl(120, 70%, 45%)", "hsl(180, 75%, 45%)", "hsl(210, 85%, 55%)",
-    "hsl(260, 75%, 60%)", "hsl(300, 70%, 55%)", "hsl(330, 80%, 55%)",
-    "hsl(45, 100%, 60%)"
+    "hsl(0, 75%, 58%)", "hsl(23, 75%, 46%)",
+    "hsl(45, 75%, 49%)", "hsl(68, 62%, 40%)",
+    "hsl(90, 62%, 48%)", "hsl(113, 90%, 43%)",
+    "hsl(135, 66%, 40%)", "hsl(158, 66%, 41%)",
+    "hsl(180, 75%, 44%)", "hsl(203, 75%, 46%)",
+    "hsl(225, 75%, 58%)", "hsl(248, 70%, 44%)",
+    "hsl(270, 89%, 52%)", "hsl(293, 80%, 40%)",
+    "hsl(315, 75%, 58%)", "hsl(338, 75%, 46%)"
 ];
 
 function hashStringToIndex(str, modulo) {
