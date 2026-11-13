@@ -568,6 +568,13 @@ function finalizeRound(code) {
 function sessionBeginRound(code, gameId) {
     const s = sessionFor(code);
     if (!s || s.done) return;
+
+    // A round is already being played and someone is still in it: this
+    // launch is a LATE JOINER coming through the hub on their own. They
+    // join that round (or wander into another game, which then is simply
+    // not part of the session); either way the round in flight is kept.
+    if (s.current && namesInRoom(roomKeyFor(s.current.gameId, code)).size > 0) return;
+
     if (s.current && s.current.grace) clearTimeout(s.current.grace);
     s.current = {
         gameId: gameId,
@@ -583,6 +590,7 @@ function sessionCancelRound(code) {
     const s = sessions.get(code);
     if (!s || !s.current) return;
     if (s.current.entered.size > 0 || s.current.reports.size > 0) return;
+    if (namesInRoom(roomKeyFor(s.current.gameId, code)).size > 0) return;
     s.current = null;
 }
 
