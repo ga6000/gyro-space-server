@@ -246,6 +246,8 @@ function cancelLaunch(roomKey, reason) {
 
     console.log(`Launch cancelled in ${roomKey}: ${reason}`);
 
+    sessionCancelRound(room.code);
+
     broadcastToRoom(roomKey, {
         type: "launch-cancel",
         reason: reason
@@ -280,6 +282,8 @@ function evaluateLaunch(roomKey) {
     }, LAUNCH_DELAY_MS);
 
     console.log(`Launching ${room.lobby.leader} in ${roomKey} (${room.players.size} players)`);
+
+    sessionBeginRound(room.code, room.lobby.leader);
 
     broadcastToRoom(roomKey, {
         type: "launch",
@@ -365,6 +369,227 @@ function refreshLobby(roomKey) {
     broadcastToRoom(roomKey, lobbyMessage(room));
     evaluateLaunch(roomKey);
 }
+
+
+// ===================================================
+//   PARTY SESSION  (added 2026-11-13)
+// ===================================================
+// A party session is X games played in a row by one room code, with a
+// running standings table and one winner at the end. It is keyed by room
+// CODE, not by room key, and it lives in its own map for one reason: the
+// hub room ("_hub:ASDF") empties the moment everyone navigates into a
+// game, and an empty room is deleted. The session has to survive that
+// trip and still be there when the group comes back.
+//
+// The server knows nothing about individual games. A game reports each
+// player's own score for the round ("session-report"); the server ranks
+// the reports, pays placement points, and keeps the totals. Scores are
+// self-reported, like the leaderboard's -- fine for a friend group.
+//
+//   mode  "story" | "free"  -- only the hub reads it (which tiles are
+//                              open); the server just stores it.
+//   total number of games in the session
+//   rounds  finished games, oldest first
+//   current the game in flight, or null between games
+const sessions = new Map();
+
+const SESSION_IDLE_MS = 3 * 60 * 60 * 1000;
+const SESSION_MAX_GAMES = 9;
+const PLACE_POINTS = [10, 7, 5, 3];   // 5th and below get 1
+const CLEAR_BONUS = 2;                // each, when the group beats the game
+// After the first FINAL report, how long to wait for the rest before the
+// round is scored without them. Covers a frozen tab; a closed tab is
+// noticed at once through its socket.
+const REPORT_GRACE_MS = 15000;
+
+function sessionFor(code) {
+    const s = sessions.get(code);
+    if (!s) return null;
+    if (Date.now() - s.touched > SESSION_IDLE_MS) {
+        endSession(code);
+        return null;
+    }
+    return s;
+}
+
+function endSession(code) {
+    const s = sessions.get(code);
+    if (!s) return;
+    if (s.current && s.current.grace) clearTimeout(s.current.grace);
+    sessions.delete(code);
+    console.log(`Session ended: ${code}`);
+}
+
+function sessionAddPlayer(session, player) {
+    if (!player.name || session.done) return;
+    if (!session.players.has(player.name)) {
+        session.players.set(player.name, { color: player.color });
+    }
+}
+
+function placePoints(place) {
+    return PLACE_POINTS[place - 1] || 1;
+}
+
+function sessionStandings(session) {
+    const rows = new Map();
+    for (const [name, p] of session.players) {
+        rows.set(name, { name: name, color: p.color, points: 0, firsts: 0, raw: 0, played: 0 });
+    }
+    for (const round of session.rounds) {
+        for (const r of round.results) {
+            if (!rows.has(r.name)) {
+                rows.set(r.name, { name: r.name, color: r.color, points: 0, firsts: 0, raw: 0, played: 0 });
+            }
+            const row = rows.get(r.name);
+            row.points += r.points + r.bonus;
+            row.raw += r.score;
+            row.played += 1;
+            if (r.place === 1) row.firsts += 1;
+        }
+    }
+    const list = Array.from(rows.values());
+    // Points, then most first places, then raw score. Equal on all three
+    // is a shared place.
+    list.sort((a, b) => (b.points - a.points) || (b.firsts - a.firsts) || (b.raw - a.raw) || a.name.localeCompare(b.name));
+    list.forEach((row, i) => {
+        const prev = list[i - 1];
+        row.place = (prev && prev.points === row.points && prev.firsts === row.firsts && prev.raw === row.raw)
+            ? prev.place : i + 1;
+    });
+    return list;
+}
+
+function sessionMessage(code) {
+    const s = sessionFor(code);
+    if (!s) return { type: "session", session: null };
+
+    const standings = sessionStandings(s);
+    return {
+        type: "session",
+        session: {
+            id: s.id,
+            mode: s.mode,
+            total: s.total,
+            done: s.done,
+            rounds: s.rounds,
+            standings: standings,
+            winners: s.done ? standings.filter(r => r.place === 1).map(r => r.name) : [],
+            pointsTable: PLACE_POINTS,
+            clearBonus: CLEAR_BONUS,
+            current: s.current ? {
+                gameId: s.current.gameId,
+                // A duration, never a wall-clock time: friends' clocks
+                // disagree (same reasoning as LAUNCH_DELAY_MS).
+                elapsedMs: Date.now() - s.current.startedAt,
+                reported: Array.from(s.current.reports.entries())
+                    .filter(([, r]) => r.final).map(([name]) => name)
+            } : null
+        }
+    };
+}
+
+// The hub for this code, plus the room of the game in flight.
+function broadcastSession(code) {
+    const msg = sessionMessage(code);
+    broadcastToRoom(roomKeyFor(HUB_GAME, code), msg);
+    const s = sessions.get(code);
+    if (s && s.current) broadcastToRoom(roomKeyFor(s.current.gameId, code), msg);
+}
+
+function namesInRoom(roomKey) {
+    const room = rooms.get(roomKey);
+    return room ? roomPlayerKeys(room) : new Set();
+}
+
+function maybeFinalizeRound(code) {
+    const s = sessions.get(code);
+    if (!s || !s.current) return;
+    const cur = s.current;
+
+    let anyFinal = false;
+    for (const r of cur.reports.values()) if (r.final) anyFinal = true;
+    if (!anyFinal) return;
+
+    // Everyone who entered has either sent a final score or has gone.
+    const present = namesInRoom(roomKeyFor(cur.gameId, code));
+    for (const name of cur.entered) {
+        const r = cur.reports.get(name);
+        if (r && r.final) continue;
+        if (present.has(name)) return;
+    }
+    finalizeRound(code);
+}
+
+function finalizeRound(code) {
+    const s = sessions.get(code);
+    if (!s || !s.current) return;
+    const cur = s.current;
+    if (cur.grace) clearTimeout(cur.grace);
+
+    // Everyone who entered counts, including someone who left early: they
+    // keep whatever their last live score was, or zero.
+    const names = new Set(cur.entered);
+    for (const name of cur.reports.keys()) names.add(name);
+
+    let cleared = false;
+    const results = [];
+    for (const name of names) {
+        const r = cur.reports.get(name) || { score: 0, cleared: false };
+        if (r.final && r.cleared) cleared = true;
+        const p = s.players.get(name);
+        results.push({ name: name, color: p ? p.color : getColorFromName(name), score: r.score });
+    }
+    results.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+    results.forEach((r, i) => {
+        const prev = results[i - 1];
+        r.place = (prev && prev.score === r.score) ? prev.place : i + 1;
+        r.points = placePoints(r.place);
+        r.bonus = cleared ? CLEAR_BONUS : 0;
+    });
+
+    // The room of the game that just ended still needs the result, and
+    // broadcastSession only reaches a game room while it is current.
+    const gameRoomKey = roomKeyFor(cur.gameId, code);
+
+    s.rounds.push({ gameId: cur.gameId, cleared: cleared, results: results });
+    s.current = null;
+    s.touched = Date.now();
+    if (s.rounds.length >= s.total) s.done = true;
+
+    console.log(`Session ${code}: round ${s.rounds.length}/${s.total} (${cur.gameId}) scored`);
+
+    broadcastSession(code);
+    broadcastToRoom(gameRoomKey, sessionMessage(code));
+}
+
+// Called when the hub's launch countdown starts. Undone by cancelLaunch
+// if the countdown is cancelled before anyone has entered the game.
+function sessionBeginRound(code, gameId) {
+    const s = sessionFor(code);
+    if (!s || s.done) return;
+    if (s.current && s.current.grace) clearTimeout(s.current.grace);
+    s.current = {
+        gameId: gameId,
+        startedAt: Date.now() + LAUNCH_DELAY_MS,
+        entered: new Set(),
+        reports: new Map(),
+        grace: null
+    };
+    s.touched = Date.now();
+}
+
+function sessionCancelRound(code) {
+    const s = sessions.get(code);
+    if (!s || !s.current) return;
+    if (s.current.entered.size > 0 || s.current.reports.size > 0) return;
+    s.current = null;
+}
+
+const sessionSweep = setInterval(() => {
+    for (const code of Array.from(sessions.keys())) sessionFor(code);
+}, 10 * 60 * 1000);
+if (sessionSweep.unref) sessionSweep.unref();
 
 
 // When a player connects
@@ -492,6 +717,22 @@ server.on("connection", socket => {
                 // send: that would deliver the same thing twice.
                 broadcastPresence(code);
 
+                // Party session (see PARTY SESSION above). The hub always
+                // gets a snapshot, even an empty one, so it can tell a
+                // server that has sessions from one that predates them.
+                // A game gets one only when it IS the game in flight.
+                const joinSession = sessionFor(code);
+                if (game === HUB_GAME) {
+                    if (joinSession) sessionAddPlayer(joinSession, player);
+                    if (joinSession) broadcastSession(code);
+                    else socket.send(JSON.stringify(sessionMessage(code)));
+                } else if (joinSession && joinSession.current && joinSession.current.gameId === game) {
+                    sessionAddPlayer(joinSession, player);
+                    if (player.name) joinSession.current.entered.add(player.name);
+                    joinSession.touched = Date.now();
+                    socket.send(JSON.stringify(sessionMessage(code)));
+                }
+
                 return;
             }
 
@@ -613,6 +854,92 @@ server.on("connection", socket => {
                     ax: data.ax,
                     ay: data.ay
                 }, socket);
+
+                return;
+            }
+
+
+            // ===================================================
+            //   PARTY SESSION MESSAGES
+            // ===================================================
+            if (data.type === "session-start") {
+
+                if (room.game !== HUB_GAME) return;
+
+                const mode = data.mode === "free" ? "free" : "story";
+                const total = Math.max(1, Math.min(SESSION_MAX_GAMES, Math.round(Number(data.total)) || 3));
+
+                endSession(room.code);
+                const fresh = {
+                    id: Math.random().toString(36).substring(2, 10),
+                    mode: mode,
+                    total: total,
+                    players: new Map(),
+                    rounds: [],
+                    current: null,
+                    done: false,
+                    touched: Date.now()
+                };
+                for (const entry of room.players.values()) sessionAddPlayer(fresh, entry.player);
+                sessions.set(room.code, fresh);
+
+                // A new session is a new ballot: the open tiles change.
+                room.votes.clear();
+                broadcastToRoom(roomKey, { type: "votes", votes: [] });
+                refreshLobby(roomKey);
+
+                console.log(`Session started: ${room.code} (${mode}, ${total} games)`);
+                broadcastSession(room.code);
+
+                return;
+            }
+
+
+            if (data.type === "session-end") {
+
+                if (room.game !== HUB_GAME) return;
+
+                endSession(room.code);
+                broadcastSession(room.code);
+
+                return;
+            }
+
+
+            // A game reporting this player's own score. `final:false` is a
+            // live score, kept so someone who drops still has a number;
+            // `final:true` is the end of their round.
+            if (data.type === "session-report") {
+
+                const s = sessionFor(room.code);
+                if (!s || !s.current || s.current.gameId !== room.game) return;
+                if (!player.name) return;
+
+                const cur = s.current;
+                const score = Math.max(0, Math.round(Number(data.score)) || 0);
+                const prev = cur.reports.get(player.name);
+                if (prev && prev.final) return;   // A final score is final
+
+                cur.entered.add(player.name);
+                cur.reports.set(player.name, {
+                    score: score,
+                    cleared: !!data.cleared,
+                    final: !!data.final
+                });
+                s.touched = Date.now();
+
+                if (data.final) {
+                    if (!cur.grace) {
+                        const code = room.code;
+                        cur.grace = setTimeout(() => {
+                            const live = sessions.get(code);
+                            if (live && live.current === cur) finalizeRound(code);
+                        }, REPORT_GRACE_MS);
+                    }
+                    maybeFinalizeRound(room.code);
+                    // Still waiting on someone: let the room see who is in.
+                    if (s.current === cur) broadcastSession(room.code);
+                }
 
                 return;
             }
@@ -783,6 +1110,10 @@ server.on("connection", socket => {
                 // After the cleanup, so a room that just emptied isn't
                 // still counted in the snapshot.
                 broadcastPresence(room.code);
+
+                // Someone leaving a game mid-round may be the last one the
+                // round was waiting on.
+                if (room.game !== HUB_GAME) maybeFinalizeRound(room.code);
             }
 
         } else {
