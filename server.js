@@ -269,6 +269,9 @@ function evaluateLaunch(roomKey) {
         if (!room.lobby.ready.has(name)) return;
     }
 
+    // Alone, there is nobody to wait for: no 3-2-1 (2026-11-13).
+    const delayMs = room.players.size <= 1 ? 0 : LAUNCH_DELAY_MS;
+
     room.lobby.timer = setTimeout(() => {
         const current = rooms.get(roomKey);
         if (!current) return;
@@ -279,16 +282,16 @@ function evaluateLaunch(roomKey) {
         // player who bounces straight back to the hub doesn't walk into
         // a stale all-ready state that immediately fires again.
         current.lobby.ready.clear();
-    }, LAUNCH_DELAY_MS);
+    }, Math.max(delayMs, 400));
 
     console.log(`Launching ${room.lobby.leader} in ${roomKey} (${room.players.size} players)`);
 
-    sessionBeginRound(room.code, room.lobby.leader);
+    sessionBeginRound(room.code, room.lobby.leader, delayMs);
 
     broadcastToRoom(roomKey, {
         type: "launch",
         gameId: room.lobby.leader,
-        delayMs: LAUNCH_DELAY_MS
+        delayMs: delayMs
     });
 }
 
@@ -420,11 +423,35 @@ function endSession(code) {
     console.log(`Session ended: ${code}`);
 }
 
+// THE CREW (2026-11-13). Each player in a session plays one of the six
+// crew. A role is held by one player while there are roles to go round
+// (six); a seventh player shares. Picked on the hub ("session-role")
+// before the first game; once a game has been launched, anyone without
+// one (a late joiner, or someone who never picked) is dealt a role nobody
+// holds.
+const CREW_ROLES = ["medic", "engineer", "scout", "gunner", "butcher", "bulwark"];
+
+function sessionRoleFree(session, role, exceptName) {
+    for (const [name, p] of session.players) {
+        if (name !== exceptName && p.role === role) return false;
+    }
+    return true;
+}
+
+function sessionDealRole(session, name) {
+    const p = session.players.get(name);
+    if (!p || p.role) return;
+    const free = CREW_ROLES.filter(r => sessionRoleFree(session, r, name));
+    const pool = free.length ? free : CREW_ROLES;
+    p.role = pool[Math.floor(Math.random() * pool.length)];
+}
+
 function sessionAddPlayer(session, player) {
     if (!player.name || session.done) return;
     if (!session.players.has(player.name)) {
-        session.players.set(player.name, { color: player.color });
+        session.players.set(player.name, { color: player.color, role: null });
     }
+    if (session.launched) sessionDealRole(session, player.name);
 }
 
 function placePoints(place) {
@@ -434,7 +461,7 @@ function placePoints(place) {
 function sessionStandings(session) {
     const rows = new Map();
     for (const [name, p] of session.players) {
-        rows.set(name, { name: name, color: p.color, points: 0, firsts: 0, raw: 0, played: 0 });
+        rows.set(name, { name: name, color: p.color, role: p.role || null, points: 0, firsts: 0, raw: 0, played: 0 });
     }
     for (const round of session.rounds) {
         for (const r of round.results) {
@@ -472,6 +499,8 @@ function sessionMessage(code) {
             mode: s.mode,
             total: s.total,
             done: s.done,
+            launched: !!s.launched,
+            at: s.at || null,
             rounds: s.rounds,
             standings: standings,
             winners: s.done ? standings.filter(r => r.place === 1).map(r => r.name) : [],
@@ -565,7 +594,12 @@ function finalizeRound(code) {
 
 // Called when the hub's launch countdown starts. Undone by cancelLaunch
 // if the countdown is cancelled before anyone has entered the game.
-function sessionBeginRound(code, gameId) {
+// After the count the hub walks the party to the tile and shows a chapter
+// card before the game opens (hub-crew.js: WALK_MAX_MS + CHAPTER_CARD_MS).
+// A round's clock starts when the game does, so that trip is allowed for.
+const LAUNCH_TRAVEL_MS = 3400;
+
+function sessionBeginRound(code, gameId, delayMs) {
     const s = sessionFor(code);
     if (!s || s.done) return;
 
@@ -577,11 +611,18 @@ function sessionBeginRound(code, gameId) {
 
     if (s.current && s.current.grace) clearTimeout(s.current.grace);
 
+    // From the first launch on, nobody is without a character, and the
+    // party's place on the board is the game it last set out for.
+    s.launched = true;
+    s.prevAt = s.at || null;
+    s.at = gameId;
+    for (const name of s.players.keys()) sessionDealRole(s, name);
+
     // A game that does not report a score is played outside the session.
     if (s.scored && !s.scored.has(gameId)) { s.current = null; return; }
     s.current = {
         gameId: gameId,
-        startedAt: Date.now() + LAUNCH_DELAY_MS,
+        startedAt: Date.now() + (delayMs == null ? LAUNCH_DELAY_MS : delayMs) + LAUNCH_TRAVEL_MS,
         entered: new Set(),
         reports: new Map(),
         grace: null
@@ -591,7 +632,12 @@ function sessionBeginRound(code, gameId) {
 
 function sessionCancelRound(code) {
     const s = sessions.get(code);
-    if (!s || !s.current) return;
+    if (!s) return;
+    // The party did not set out after all: back to the tile it stood on.
+    if (s.prevAt !== undefined && !(s.current && (s.current.entered.size > 0 || s.current.reports.size > 0))) {
+        s.at = s.prevAt;
+    }
+    if (!s.current) return;
     if (s.current.entered.size > 0 || s.current.reports.size > 0) return;
     if (namesInRoom(roomKeyFor(s.current.gameId, code)).size > 0) return;
     s.current = null;
@@ -910,6 +956,27 @@ server.on("connection", socket => {
                 refreshLobby(roomKey);
 
                 console.log(`Session started: ${room.code} (${mode}, ${total} games)`);
+                broadcastSession(room.code);
+
+                return;
+            }
+
+
+            // Pick a character. Refused (silently, with a fresh snapshot)
+            // when someone else holds it and there are still free ones.
+            if (data.type === "session-role") {
+
+                if (room.game !== HUB_GAME) return;
+                const s = sessionFor(room.code);
+                if (!s || s.done || !player.name) return;
+                sessionAddPlayer(s, player);
+                const role = String(data.role || "");
+                const me = s.players.get(player.name);
+                if (me && CREW_ROLES.includes(role)) {
+                    const anyFree = CREW_ROLES.some(r => sessionRoleFree(s, r, player.name));
+                    if (sessionRoleFree(s, role, player.name) || !anyFree) me.role = role;
+                }
+                s.touched = Date.now();
                 broadcastSession(room.code);
 
                 return;
