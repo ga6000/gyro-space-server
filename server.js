@@ -555,7 +555,7 @@ function finalizeRound(code) {
     s.rounds.push({ gameId: cur.gameId, cleared: cleared, results: results });
     s.current = null;
     s.touched = Date.now();
-    if (s.rounds.length >= s.total) s.done = true;
+    if (s.total > 0 && s.rounds.length >= s.total) s.done = true;
 
     console.log(`Session ${code}: round ${s.rounds.length}/${s.total} (${cur.gameId}) scored`);
 
@@ -576,6 +576,9 @@ function sessionBeginRound(code, gameId) {
     if (s.current && namesInRoom(roomKeyFor(s.current.gameId, code)).size > 0) return;
 
     if (s.current && s.current.grace) clearTimeout(s.current.grace);
+
+    // A game that does not report a score is played outside the session.
+    if (s.scored && !s.scored.has(gameId)) { s.current = null; return; }
     s.current = {
         gameId: gameId,
         startedAt: Date.now() + LAUNCH_DELAY_MS,
@@ -875,13 +878,23 @@ server.on("connection", socket => {
                 if (room.game !== HUB_GAME) return;
 
                 const mode = data.mode === "free" ? "free" : "story";
-                const total = Math.max(1, Math.min(SESSION_MAX_GAMES, Math.round(Number(data.total)) || 3));
+                // total 0 is OPEN-ENDED (free play): a running score with no
+                // last game, until someone ends it.
+                const total = Number(data.total) === 0
+                    ? 0
+                    : Math.max(1, Math.min(SESSION_MAX_GAMES, Math.round(Number(data.total)) || 3));
+                // The games that report a score. A launch of any other game
+                // is simply not a round. Absent (an older hub): every game is.
+                const scored = Array.isArray(data.games)
+                    ? new Set(data.games.filter(g => typeof g === "string").slice(0, 64))
+                    : null;
 
                 endSession(room.code);
                 const fresh = {
                     id: Math.random().toString(36).substring(2, 10),
                     mode: mode,
                     total: total,
+                    scored: scored,
                     players: new Map(),
                     rounds: [],
                     current: null,
@@ -897,6 +910,21 @@ server.on("connection", socket => {
                 refreshLobby(roomKey);
 
                 console.log(`Session started: ${room.code} (${mode}, ${total} games)`);
+                broadcastSession(room.code);
+
+                return;
+            }
+
+
+            // Call it now: the standings as they are become the result. How
+            // an open-ended (free play) session gets a winner.
+            if (data.type === "session-finish") {
+
+                if (room.game !== HUB_GAME) return;
+                const s = sessionFor(room.code);
+                if (!s || s.done || s.current || s.rounds.length === 0) return;
+                s.done = true;
+                s.touched = Date.now();
                 broadcastSession(room.code);
 
                 return;
